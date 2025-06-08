@@ -1,0 +1,183 @@
+---
+- name: Apply CIS rule only if it's a member server
+  hosts: windows
+
+  gather_facts: true
+  vars_files:
+    - variable.yml
+
+  tasks:
+    - name: "Execute The Section 1 Tasks"
+      ansible.builtin.import_tasks:
+        file: check_domain.yml
+
+# - name: "2.2.27 Ensure Deny log on through Remote Desktop Services is set to Guests Local account MS only | Member Server"
+#   when:
+#     - rule_2_2_27
+#     - is_domain_member
+#     - not win_skip_for_test
+    # --- 1. Ensure local RDP group exists ---
+    - name: "Check if '{{ local_rdp_group }}' exists"
+      when:
+        - rule_2_2_27
+        - is_domain_member
+      ansible.windows.win_shell: |
+        $groupExists = $false
+        try {
+          $null = Get-LocalGroup -Name "{{ local_rdp_group }}" -ErrorAction Stop
+          $groupExists = $true
+        } catch { }
+        [PSCustomObject]@{
+          GroupExists = $groupExists
+        } | ConvertTo-Json -Compress
+      register: rdp_group_check
+      changed_when: false
+      ignore_errors: true      
+
+    - name: "Create '{{ local_rdp_group }}' if missing"
+      when: > 
+        (rule_2_2_27) and 
+        (is_domain_member) and
+        (rdp_group_check.stdout is defined) and
+        (not (rdp_group_check.stdout | from_json).GroupExists)       
+      ansible.windows.win_group:
+        name: "{{ local_rdp_group }}"
+        description: "Members can access this machine via RDP"
+        state: present
+      register: group_creation
+      notify: refresh_policy
+
+    - name: Check existence of RDP allowed entities in Active Directory
+      block:    
+        - name: Verify entities exist in AD
+          ansible.windows.win_shell: |
+            $entity = "{{ item }}"
+            try {
+                $adObject = if ($entity -match '\\') {
+                $domain, $name = $entity -split '\\', 2
+                Get-ADObject -Filter { SamAccountName -eq $name } -Server $domain
+              } else {
+                Get-ADObject -Filter { SamAccountName -eq $entity }
+              }
+              if ($adObject) { "EXISTS" } else { "MISSING" }
+            } catch { "ERROR" }
+          register: ad_check
+          loop: "{{ rdp_allowed_entities }}"
+    
+        - name: Register valid entities
+          ansible.builtin.set_fact:
+            valid_rdp_entities: "{{ (valid_rdp_entities | default([])) + [item.item] }}"
+          when: "'EXISTS' in item.stdout"
+          loop: "{{ ad_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+      when:
+        - rule_2_2_27
+        - is_domain_member     
+
+
+    # --- 2. Add domain users/groups to local RDP group --- 
+    - name: "Add domain entities to '{{ local_rdp_group }}'"
+      when:
+        - rule_2_2_27
+        - is_domain_member
+        - (valid_rdp_entities | default([])) | length > 0       
+      block:
+        - name: Temporarily remove entities to prevent duplicates (only valid ones)
+          microsoft.ad.group:
+            name: "{{ local_rdp_group }}"
+            state: absent
+            members: "{{ valid_rdp_entities }}"
+
+        - name: Add fresh entries (only valid ones)
+          microsoft.ad.group:
+            name: "{{ local_rdp_group }}"
+            state: present
+            members: "{{ valid_rdp_entities }}"
+    # 1. Add to Remote Desktop Users (RDP)
+    - name: "Allow RDP access"
+      when:
+        - is_domain_member
+        - (valid_rdp_entities | default([])) | length > 0 
+      microsoft.ad.group:
+        name: "Remote Desktop Users"
+        members: "{{ valid_rdp_entities }}"
+        state: present            
+    # 2. Add to Remote Management Users (WinRM + PSRemoting)
+    - name: "Allow WinRM and PowerShell Remoting"
+      when:
+        - is_domain_member
+        - (valid_rdp_entities | default([])) | length > 0     
+      microsoft.ad.group:
+        name: "Remote Management Users"
+        members: "{{ valid_rdp_entities }}"
+        state: present
+
+    # 3. Add to Distributed COM Users (WMI)
+    - name: "Allow WMI access"
+      when:
+        - is_domain_member
+        - (valid_rdp_entities | default([])) | length > 0     
+      microsoft.ad.group:
+        name: "Distributed COM Users"
+        members: "{{ valid_rdp_entities }}"
+        state: present
+
+    # --- 3. Verify current RDP members ---
+    - name: "Get current RDP group members"
+      when:
+        - rule_2_2_27
+        - is_domain_member     
+      ansible.windows.win_shell: |
+        Get-LocalGroupMember -Group "{{ local_rdp_group }}" | 
+          Select-Object Name, PrincipalSource | 
+          ConvertTo-Json -Depth 2
+      register: current_rdp_members
+      changed_when: false
+
+    # --- 4. Test RDP connectivity (optional) ---
+    - name: "Test RDP port connectivity"
+      when:
+        - rule_2_2_27
+        - is_domain_member
+        - test_rdp_connectivity
+      ansible.windows.win_shell: |
+        Test-NetConnection -ComputerName localhost -Port 3389 -InformationLevel Quiet
+      register: rdp_port_test
+      changed_when: false
+
+    # --- 4. Apply security hardening ---
+    - name: "2.2.27 Ensure Deny log on through Remote Desktop Services is set to Guests Local account MS only | Member Server"
+      when:
+        - rule_2_2_27
+        - is_domain_member
+      ansible.windows.win_user_right:
+        name: SeDenyRemoteInteractiveLogonRight
+        users:
+          - "Guests"
+          - "NT AUTHORITY\\Local Account"
+        action: set
+
+    # - name: "2.2.22 Ensure Deny access to this computer from the network to include Guests Local account and member of Administrators group MS only | Member Server"
+    #   when:
+    #     - rule_2_2_22
+    #     - is_domain_member
+
+    #   ansible.windows.win_user_right:
+    #   name: SeDenyNetworkLogonRight
+    #     users:
+    #       - Guests
+    #       - Local Account
+    #       - Administrators
+    #     action: set
+
+    - name: "2.2.22 Ensure Deny access to this computer from the network to include Guests Local account and member of Administrators group MS only"
+      when:
+        - rule_2_2_22
+        - is_domain_member    
+      community.windows.win_security_policy:
+        secoption: "SeDenyNetworkLogonRight"
+        secvalue: "{{ current_deny_sids | union(required_sids) | join(',') }}"
+      vars:
+        current_deny_sids: "{{ lookup('ansible.windows.win_security_policy', 'SeDenyNetworkLogonRight').split(',') }}"
+        required_sids: ['S-1-5-32-546', 'S-1-5-113', 'S-1-5-32-544']
