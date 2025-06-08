@@ -1,0 +1,12 @@
+# 2.2.27
+# List of domain users/groups to grant RDP access
+rdp_allowed_entities:
+  - "dc\\sc_iac_ansible"   # individual users
+  - "dc\\iacuser"         # group
+rdp_denied_entities:
+  - "Guests"
+  - "NT AUTHORITY\\Local Account"  
+# 2.2.27
+# Remote desktop users 
+local_rdp_group: "Remote Desktop Users"
+test_rdp_connectivity: true
