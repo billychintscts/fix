@@ -1,0 +1,188 @@
+---
+- name: Apply CIS rule only if it's a member server
+  hosts: windows
+
+  gather_facts: true
+  vars_files:
+    - variable.yml
+
+  tasks:
+    - name: "Execute The Section 1 Tasks"
+      ansible.builtin.import_tasks:
+        file: check_domain.yml
+
+    - name: "2.3.1.4-1 Identify Administrator account by SID"
+      when:
+        - rule_2_3_1_4
+        - not is_standalone
+      ansible.windows.win_shell: |
+        try {
+          $admin = Get-LocalUser | Where-Object { $_.SID -like '{{ admin_sid_pattern }}' } | Select-Object -ExpandProperty Name -ErrorAction Stop
+          if ($admin -eq 'Administrator') { 
+            Write-Output "needs_rename" 
+          }
+          elseif ($admin -eq '{{  win22cis_admin_username }}') { 
+            Write-Output "already_renamed" 
+          }
+          else { 
+            Write-Output "unexpected_state:$admin" 
+          }
+        }
+        catch {
+          Write-Output "error:$_"
+        }
+      register: admin_check        
+      changed_when: false
+
+    - name: "2.3.1.4-2. Check for Administrator dependencies"
+      block:
+        - name: "2.3.1.4-2.1 Check Scheduled Tasks"
+          ansible.windows.win_shell: |
+            $tasks = Get-ScheduledTask | Where-Object { $_.Principal.UserId -eq "Administrator" }
+            if ($null -ne $tasks) { 
+              $tasks | Format-Table -AutoSize
+              exit 1
+            }
+            exit 0
+          register: scheduled_tasks
+          ignore_errors: true
+          changed_when: false
+  
+        - name: "2.3.1.4-2.2 Check Services"
+          ansible.windows.win_shell: |
+            $services = Get-CimInstance Win32_Service | Where-Object { $_.StartName -like "*Administrator*" }
+            if ($null -ne $services) {
+              $services | Format-Table -AutoSize
+              exit 1
+            }
+            exit 0
+          register: services
+          ignore_errors: true
+          changed_when: false     
+     
+      when:
+        - admin_check.stdout_lines is defined
+        - "'needs_rename' in admin_check.stdout_lines[0]"
+        - rule_2_3_1_4
+        - not is_standalone
+
+    - name: "2.3.1.4-3 Configure Accounts Rename administrator accountr"
+      block:
+        - name: "2.3.1.4-3.1 Perform rename"
+          community.windows.win_security_policy:
+            section: System Access
+            key: newadministratorname
+            value: "{{ win22cis_admin_username }}"
+          register: rename_result
+          notify:
+            - Verify rename
+
+        - name: "2.3.1.4-3.2 Force immediate policy apply"
+          ansible.windows.win_shell: |
+            gpupdate /force
+          when: rename_result is changed
+      when:
+        - admin_check.stdout_lines is defined
+        - "'needs_rename' in admin_check.stdout_lines[0]"
+        - scheduled_tasks.rc == 0
+        - services.rc == 0
+        - rule_2_3_1_4
+        - not is_standalone
+
+    - name: "2.3.1.5-1 Identify Guest account by SID"
+      when:
+        - rule_2_3_1_5
+        - not is_standalone
+      ansible.windows.win_shell: |
+        try {
+          $guest = Get-LocalUser | Where-Object { $_.SID -like '{{ guest_sid_pattern }}' } | Select-Object -ExpandProperty Name -ErrorAction Stop
+          if ($guest -eq 'Guest') { 
+            Write-Output "needs_rename" 
+          }
+          elseif ($guest -eq '{{  win22cis_guest_username }}') { 
+            Write-Output "already_renamed" 
+          }
+          else { 
+            Write-Output "unexpected_state:$admin" 
+          }
+        }
+        catch {
+          Write-Output "error:$_"
+        }
+      register: guest_check        
+      changed_when: false
+
+    - name: "2.3.1.5-2. Check for Guest dependencies"
+      block:
+        - name: "2.3.1.5-2.1 Check Scheduled Tasks"
+          ansible.windows.win_shell: |
+            $gtasks = Get-ScheduledTask | Where-Object { $_.Principal.UserId -eq "Guest" }
+            if ($null -ne $gtasks) { 
+              $gtasks | Format-Table -AutoSize
+              exit 1
+            }
+            exit 0
+          register: guest_scheduled_tasks
+          ignore_errors: true
+          changed_when: false
+  
+        - name: "2.3.1.5-2.2 Check Services"
+          ansible.windows.win_shell: |
+            $gservices = Get-CimInstance Win32_Service | Where-Object { $_.StartName -like "*Guest*" }
+            if ($null -ne $gservices) {
+              $gservices | Format-Table -AutoSize
+              exit 1
+            }
+            exit 0
+          register: guest_services
+          ignore_errors: true
+          changed_when: false     
+     
+      when:
+        - guest_check.stdout_lines is defined
+        - "'needs_rename' in guest_check.stdout_lines[0]"
+        - rule_2_3_1_5
+        - not is_standalone
+
+    - name: "2.3.1.5-3 Configure Accounts Rename Guest accountr"
+      block:
+        - name: "2.3.1.5-3.1 Perform rename"
+          community.windows.win_security_policy:
+            section: System Access
+            key: NewGuestName
+            value: "{{ win22cis_guest_username }}"
+          register: guest_rename_result
+          notify:
+            - Verify guest rename
+
+        - name: "2.3.1.5-3.2 Force immediate policy apply"
+          ansible.windows.win_shell: |
+            gpupdate /force
+          when: guest_rename_result is changed
+      when:
+        - guest_check.stdout_lines is defined
+        - "'needs_rename' in guest_check.stdout_lines[0]"
+        - guest_scheduled_tasks.rc == 0
+        - guest_services.rc == 0
+        - rule_2_3_1_5
+        - not is_standalone
+
+  handlers:
+    - name: "Verify rename"
+      ansible.windows.win_shell: |
+        $admin = Get-LocalUser | Where-Object { $_.SID -like '{{ admin_sid_pattern }}' }
+        if ($admin.Name -eq '{{  win22cis_admin_username }}') { exit 0 } else { exit 1 }
+      register: verify_rename
+      changed_when: false
+      ignore_errors: true
+    
+    - name: "Verify guest rename"
+      ansible.windows.win_shell: |
+        $guest = Get-LocalUser | Where-Object { $_.SID -like '{{ guest_sid_pattern }}' }
+        if ($guest.Name -eq '{{  win22cis_guest_username }}') { exit 0 } else { exit 1 }
+      register: verify_guest_rename
+      changed_when: false
+      ignore_errors: true 
+ 
+
+ 
